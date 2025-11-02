@@ -177,68 +177,68 @@ def fields_for_model(
     should be applied to a field's queryset.
     """
     field_dict = {}
-    widgets = widgets or {}
-    labels = labels or {}
-    help_texts = help_texts or {}
-    error_messages = error_messages or {}
-    field_classes = field_classes or {}
-    localized_fields = set(localized_fields or ())
+    ignored = []
+    opts = model._meta
+    # Avoid circular import
+    from django.db.models import Field as ModelField
 
-    def build_defaults(fname):
-        d = {}
-        if fname in widgets:
-            d["widget"] = widgets[fname]
-        if fname in labels:
-            d["label"] = labels[fname]
-        if fname in help_texts:
-            d["help_text"] = help_texts[fname]
-        if fname in error_messages:
-            d["error_messages"] = error_messages[fname]
-        if fname in field_classes:
-            d["form_class"] = field_classes[fname]
-        if fname in localized_fields:
-            d["localize"] = True
-        if not apply_limit_choices_to:
-            d["limit_choices_to"] = None
-        return d
-
-    if fields is not None:
-        for fname in fields:
-            if exclude and fname in exclude:
-                continue
-            try:
-                f = model._meta.get_field(fname)
-            except Exception:
-                field_dict[fname] = None
-                continue
-            defaults = build_defaults(fname)
-            if formfield_callback is not None:
-                formfield = formfield_callback(f, **defaults)
-            else:
-                formfield = f.formfield(**defaults)
-            field_dict[fname] = formfield
-        return field_dict
-
-    for f in model._meta.get_fields():
-        fname = getattr(f, "name", None)
-        if not fname:
-            continue
-        if exclude and fname in exclude:
-            continue
+    sortable_private_fields = [
+        f for f in opts.private_fields if isinstance(f, ModelField)
+    ]
+    for f in sorted(
+        chain(opts.concrete_fields, sortable_private_fields, opts.many_to_many)
+    ):
         if not getattr(f, "editable", False):
+            if (
+                fields is not None
+                and f.name in fields
+                and (exclude is None or f.name not in exclude)
+            ):
+                raise FieldError(
+                    "'%s' cannot be specified for %s model form as it is a "
+                    "non-editable field" % (f.name, model.__name__)
+                )
             continue
-        if getattr(f, "auto_created", False) and not getattr(f, "concrete", True):
+        if fields is not None and f.name not in fields:
+            continue
+        if exclude and f.name in exclude:
             continue
 
-        defaults = build_defaults(fname)
-        if formfield_callback is not None:
-            formfield = formfield_callback(f, **defaults)
+        kwargs = {}
+        if widgets and f.name in widgets:
+            kwargs["widget"] = widgets[f.name]
+        if localized_fields == ALL_FIELDS or (
+            localized_fields and f.name in localized_fields
+        ):
+            kwargs["localize"] = True
+        if labels and f.name in labels:
+            kwargs["label"] = labels[f.name]
+        if help_texts and f.name in help_texts:
+            kwargs["help_text"] = help_texts[f.name]
+        if error_messages and f.name in error_messages:
+            kwargs["error_messages"] = error_messages[f.name]
+        if field_classes and f.name in field_classes:
+            kwargs["form_class"] = field_classes[f.name]
+
+        if formfield_callback is None:
+            formfield = f.formfield(**kwargs)
+        elif not callable(formfield_callback):
+            raise TypeError("formfield_callback must be a function or callable")
         else:
-            formfield = f.formfield(**defaults)
+            formfield = formfield_callback(f, **kwargs)
 
-        if formfield is not None:
-            field_dict[fname] = formfield
-
+        if formfield:
+            if apply_limit_choices_to:
+                apply_limit_choices_to_to_formfield(formfield)
+            field_dict[f.name] = formfield
+        else:
+            ignored.append(f.name)
+    if fields:
+        field_dict = {
+            f: field_dict.get(f)
+            for f in fields
+            if (not exclude or f not in exclude) and f not in ignored
+        }
     return field_dict
 
 
@@ -253,25 +253,36 @@ class ModelFormOptions:
         self.help_texts = getattr(options, "help_texts", None)
         self.error_messages = getattr(options, "error_messages", None)
         self.field_classes = getattr(options, "field_classes", None)
-        self.formfield_callback = getattr(options, "formfield_callback", None)
+        formfield_callback = getattr(options, "formfield_callback", None)
+        if isinstance(formfield_callback, staticmethod):
+            formfield_callback = formfield_callback.__func__
+        self.formfield_callback = formfield_callback
 
 
 class ModelFormMetaclass(DeclarativeFieldsMetaclass):
     def __new__(mcs, name, bases, attrs):
-        new_class = super().__new__(mcs, name, bases, attrs)
-
-        if bases == (BaseModelForm,):
-            return new_class
-
-        opts = new_class._meta = ModelFormOptions(getattr(new_class, "Meta", None))
+        base_formfield_callback = None
+        for b in bases:
+            cb = getattr(getattr(b, "Meta", object), "formfield_callback", None)
+            if isinstance(cb, staticmethod):
+                cb = cb.__func__
+            if cb is not None:
+                base_formfield_callback = cb
+                break
         
-        formfield_callback = getattr(new_class, "formfield_callback", None)
-        if formfield_callback is None:
-            formfield_callback = opts.formfield_callback
-        elif opts.formfield_callback is None:
-            opts.formfield_callback = formfield_callback
+        formfield_callback = attrs.get("formfield_callback", None)
         if isinstance(formfield_callback, staticmethod):
             formfield_callback = formfield_callback.__func__
+
+        new_class = super().__new__(mcs, name, bases, attrs)
+        opts = new_class._meta = ModelFormOptions(getattr(new_class, "Meta", None))
+
+        if formfield_callback is None:
+            if opts.formfield_callback is not None:
+                formfield_callback = opts.formfield_callback
+            else:
+                formfield_callback = base_formfield_callback
+
         # We check if a string was passed to `fields` or `exclude`,
         # which is likely to be a mistake where the user typed ('foo') instead
         # of ('foo',)
@@ -303,17 +314,18 @@ class ModelFormMetaclass(DeclarativeFieldsMetaclass):
                 # fields from the model"
                 opts.fields = None
 
+
             fields = fields_for_model(
                 opts.model,
-                fields=opts.fields,
-                exclude=opts.exclude,
-                widgets=opts.widgets,
-                formfield_callback=formfield_callback,
-                localized_fields=opts.localized_fields,
-                labels=opts.labels,
-                help_texts=opts.help_texts,
-                error_messages=opts.error_messages,
-                field_classes=opts.field_classes,
+                opts.fields,
+                opts.exclude,
+                opts.widgets,
+                formfield_callback,
+                opts.localized_fields,
+                opts.labels,
+                opts.help_texts,
+                opts.error_messages,
+                opts.field_classes,
                 apply_limit_choices_to=False,
             )
 
@@ -331,6 +343,9 @@ class ModelFormMetaclass(DeclarativeFieldsMetaclass):
             fields = new_class.declared_fields
 
         new_class.base_fields = fields
+        # Store formfield_callback on the class if it exists
+        if formfield_callback is not None:
+            new_class.formfield_callback = staticmethod(formfield_callback)
 
         return new_class
 
@@ -413,7 +428,7 @@ class BaseModelForm(BaseForm):
             # Exclude empty fields that are not required by the form, if the
             # underlying model field is required. This keeps the model field
             # from raising a required error. Note: don't exclude the field from
-            # validation if th model field allows blanks. If it does, the blank
+            # validation if the model field allows blanks. If it does, the blank
             # value may be included in a unique check, so cannot be excluded
             # from validation.
             else:
@@ -574,13 +589,22 @@ def modelform_factory(
 ):
     if formfield_callback is None:
         if hasattr(form, "formfield_callback"):
-            formfield_callback = form.formfield_callback
-            if isinstance(formfield_callback, staticmethod):
-                formfield_callback = formfield_callback.__func__
-        elif hasattr(form, "Meta") and hasattr(form.Meta, "formfield_callback"):
-            formfield_callback = form.Meta.formfield_callback
-            if isinstance(formfield_callback, staticmethod):
-                formfield_callback = formfield_callback.__func__
+            cb = form.formfield_callback
+            if isinstance(cb, staticmethod):
+                formfield_callback = cb.__func__
+            else:
+                formfield_callback = cb
+        elif hasattr(form, "Meta"):
+            # Use inspect.getattr_static to get the raw descriptor
+            import inspect
+            try:
+                cb = inspect.getattr_static(form.Meta, "formfield_callback")
+                if isinstance(cb, staticmethod):
+                    formfield_callback = cb.__func__
+                else:
+                    formfield_callback = cb
+            except AttributeError:
+                pass
 
     attrs = {"model": model}
     if fields is not None:
@@ -602,19 +626,23 @@ def modelform_factory(
 
     bases = (form.Meta,) if hasattr(form, "Meta") else ()
     Meta = type("Meta", bases, attrs)
+    if formfield_callback is not None:
+        Meta.formfield_callback = staticmethod(formfield_callback)
+
+    class_name = model.__name__ + "Form"
 
     form_class_attrs = {"Meta": Meta}
     if formfield_callback is not None:
         form_class_attrs["formfield_callback"] = staticmethod(formfield_callback)
 
-    class_name = model.__name__ + "Form"
-
     if getattr(Meta, "fields", None) is None and getattr(Meta, "exclude", None) is None:
-        raise ImproperlyConfigured(
-            "Calling modelform_factory without defining 'fields' or 'exclude' explicitly is prohibited."
-        )
+       raise ImproperlyConfigured(
+           "Calling modelform_factory without defining 'fields' or "
+           "'exclude' explicitly is prohibited."
+       )
 
     return type(form)(class_name, (form,), form_class_attrs)
+
 
 # ModelFormSets ##############################################################
 
@@ -1483,7 +1511,7 @@ class ModelChoiceField(ChoiceField):
         if hasattr(self, "_choices"):
             return self._choices
 
-        # Otherwise execute the QuerySet in self.queryset to determine the
+        # Otherwise, execute the QuerySet in self.queryset to determine the
         # choices dynamically. Return a fresh ModelChoiceIterator that has not been
         # consumed. Note that we're instantiating a new ModelChoiceIterator *each*
         # time _get_choices() is called (and, thus, each time self.choices is
@@ -1539,7 +1567,7 @@ class ModelMultipleChoiceField(ModelChoiceField):
         "invalid_choice": _(
             "Select a valid choice. %(value)s is not one of the available choices."
         ),
-        "invalid_pk_value": _(" ?(pk)s ?is not a valid value."),
+        "invalid_pk_value": _("“%(pk)s” is not a valid value."),
     }
 
     def __init__(self, queryset, **kwargs):
@@ -1632,4 +1660,3 @@ def modelform_defines_fields(form_class):
     return hasattr(form_class, "_meta") and (
         form_class._meta.fields is not None or form_class._meta.exclude is not None
     )
-
