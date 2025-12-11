@@ -5,7 +5,7 @@ Description
 	 
 		(last modified by Klaas-Jan Gorter)
 	 
-The function django.forms.modelform_factory returns a form class based on the class it recieves as form argument. As an additional argument it accepts a formfield_callback function. When no callback is provided the class uses no callback instead of the formfield_callback of the base form provided.
+The function django.forms.modelform_factory returns a form class based on the class it recieves as form argument. As an additional argument it accepts a formfield_callback function. When no callback is provided the class uses no callback instead of the formfield_callback of the base form provided
 Example:
 from django import forms
 form django.db import models
